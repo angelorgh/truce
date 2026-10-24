@@ -671,7 +671,10 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             let event_slice = slice::from_raw_parts(events, num_events as usize);
             for ev in event_slice {
                 if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
-                    scr.event_list.push(Event {
+                    // Fail closed: a burst past the reserved capacity
+                    // drops the excess (counted in `dropped_events`)
+                    // rather than reallocating on the audio thread.
+                    let _ = scr.event_list.try_push(Event {
                         sample_offset: ev.sample_offset,
                         port: 0,
                         body,
@@ -695,7 +698,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
                 match mt {
                     0x4 => {
                         if let Some(body) = decode_ump_channel_voice_2(ev.words) {
-                            scr.event_list.push(Event {
+                            let _ = scr.event_list.try_push(Event {
                                 sample_offset: ev.sample_offset,
                                 port: 0,
                                 body,
@@ -744,7 +747,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
         if !param_events.is_null() && num_param_events > 0 {
             let pe_slice = slice::from_raw_parts(param_events, num_param_events as usize);
             for pe in pe_slice {
-                scr.event_list.push(Event {
+                let _ = scr.event_list.try_push(Event {
                     sample_offset: pe.sample_offset,
                     port: 0,
                     body: EventBody::ParamChange {

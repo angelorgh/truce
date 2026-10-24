@@ -813,7 +813,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                     decode_short_message(ev.status, ev.data1, ev.data2)
                 };
                 if let Some(body) = body {
-                    scr.event_list.push(Event {
+                    let _ = scr.event_list.try_push(Event {
                         sample_offset: ev.sample_offset,
                         port: ev.port,
                         body,
@@ -863,7 +863,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                 if let Some((port, channel, controller)) = midi_proxy_decode(pc.id) {
                     #[allow(clippy::cast_possible_truncation)]
                     let normalized = pc.value.clamp(0.0, 1.0) as f32;
-                    scr.event_list.push(Event::on_port(
+                    let _ = scr.event_list.try_push(Event::on_port(
                         sample_offset,
                         port,
                         midi_proxy_event(channel, controller, normalized),
@@ -883,13 +883,13 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                 // originating port to recover - unlike the per-bus
                 // proxy ids decoded above.
                 if let Ok(idx) = inst.midi_maps.binary_search_by_key(&pc.id, |(id, _)| *id) {
-                    scr.event_list.push(Event {
+                    let _ = scr.event_list.try_push(Event {
                         sample_offset,
                         port: 0,
                         body: midi_event_from_map(&inst.midi_maps[idx].1, pc.value),
                     });
                 }
-                scr.event_list.push(Event {
+                let _ = scr.event_list.try_push(Event {
                     sample_offset,
                     port: 0,
                     body: EventBody::ParamChange {

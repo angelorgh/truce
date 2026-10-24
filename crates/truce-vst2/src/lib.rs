@@ -569,7 +569,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             let event_slice = slice::from_raw_parts(events, num_events as usize);
             for ev in event_slice {
                 if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
-                    scr.event_list.push(Event {
+                    let _ = scr.event_list.try_push(Event {
                         sample_offset: ev.delta_frames,
                         port: 0,
                         body,

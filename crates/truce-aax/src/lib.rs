@@ -1210,7 +1210,7 @@ pub unsafe fn _process<P: PluginExport>(
             let ev_slice = unsafe { slice::from_raw_parts(events, num_events as usize) };
             for ev in ev_slice {
                 if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
-                    scr.event_list.push(Event {
+                    let _ = scr.event_list.try_push(Event {
                         sample_offset: ev.delta_frames,
                         port: 0,
                         body,

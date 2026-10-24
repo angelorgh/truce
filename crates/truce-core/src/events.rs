@@ -329,11 +329,11 @@ pub const EVENT_LIST_PREALLOC: usize = 256;
 /// match.
 pub const SYSEX_POOL_PREALLOC: usize = 128 * 1024;
 
-/// Why a push into the [`EventList`] failed. Today only `SysEx`
-/// payloads can fail to land (the channel-voice [`EventList::push`]
-/// path grows the backing `Vec` instead, since the audio-thread
-/// contract there is "stay under [`EVENT_LIST_PREALLOC`]" rather
-/// than "fail closed").
+/// Why a `SysEx` push into the [`EventList`] failed. Only
+/// [`EventList::push_sysex`] and [`EventList::push_sysex_on_port`]
+/// report it; the channel-voice [`EventList::push`] path grows the
+/// backing `Vec` instead, and the fail-closed [`EventList::try_push`]
+/// reports [`EventListFull`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushError {
     /// The `SysEx` byte pool is full. The message wasn't appended.
@@ -352,6 +352,39 @@ impl core::fmt::Display for PushError {
 
 impl std::error::Error for PushError {}
 
+/// [`EventList::try_push`] refused an event: the list is at its
+/// reserved capacity (or, for a droppable event, inside the slice kept
+/// back for note-offs). The event wasn't appended and
+/// [`EventList::dropped_events`] counted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventListFull;
+
+impl core::fmt::Display for EventListFull {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("event list is full")
+    }
+}
+
+impl std::error::Error for EventListFull {}
+
+/// Upper bound on the slice of an [`EventList`]'s capacity that only
+/// note-off and all-notes-off events may use; see [`EventList::try_push`].
+/// Lists smaller than `4 * NOTE_OFF_RESERVE` reserve a quarter of their
+/// capacity instead.
+pub const NOTE_OFF_RESERVE: usize = 16;
+
+/// Events that must still land when the list is nearly full, because
+/// dropping one leaves a note hanging: note-offs and the
+/// all-sound-off / all-notes-off controllers (CC 120 and 123).
+fn is_note_release(body: &EventBody) -> bool {
+    match *body {
+        EventBody::NoteOff { .. } | EventBody::NoteOff2 { .. } => true,
+        EventBody::ControlChange { cc, .. } | EventBody::ControlChange2 { cc, .. } => {
+            cc == 120 || cc == 123
+        }
+        _ => false,
+    }
+}
 /// Ordered list of events within a process block.
 ///
 /// `events` is the per-block event ring; `sysex_pool` is the
@@ -363,6 +396,9 @@ impl std::error::Error for PushError {}
 pub struct EventList {
     events: Vec<Event>,
     sysex_pool: Vec<u8>,
+    /// Events refused by the fail-closed push paths since construction.
+    /// Not reset by [`EventList::clear`]; see [`EventList::dropped_events`].
+    dropped: u64,
 }
 
 impl EventList {
@@ -383,6 +419,7 @@ impl EventList {
         Self {
             events: Vec::with_capacity(capacity),
             sysex_pool: Vec::with_capacity(SYSEX_POOL_PREALLOC),
+            dropped: 0,
         }
     }
 
@@ -391,8 +428,68 @@ impl EventList {
     /// block must validate `sample_offset < num_samples` themselves
     /// (the audio thread can't recover from an out-of-range offset, so
     /// we treat that as a contract violation rather than panicking).
+    ///
+    /// Grows the backing `Vec` when the list is full, which allocates.
+    /// Safe on any thread that may allocate (plugin setup, tests); on
+    /// the audio thread use [`Self::try_push`], which refuses instead.
     pub fn push(&mut self, event: Event) {
         self.events.push(event);
+    }
+
+    /// Append an event without ever reallocating: the audio-thread
+    /// counterpart of [`Self::push`]. Format wrappers use it when
+    /// merging host input (MIDI, parameter changes) into the block's
+    /// list, so a burst past the reserved capacity drops the excess
+    /// instead of calling the allocator.
+    ///
+    /// The last `min(`[`NOTE_OFF_RESERVE`]`, capacity / 4)` slots are kept
+    /// for note-offs and all-notes-off controllers (see
+    /// [`Self::note_off_reserve`]): every other event is refused once
+    /// the list reaches that point, so a full buffer never drops a
+    /// release and leaves a note hanging.
+    ///
+    /// A refused event is *not* appended and increments
+    /// [`Self::dropped_events`]. A list built with
+    /// `EventList::default()` reserves nothing and so refuses every
+    /// event; build it with [`Self::with_capacity`].
+    ///
+    /// # Errors
+    /// [`EventListFull`] when there is no room for this event.
+    pub fn try_push(&mut self, event: Event) -> Result<(), EventListFull> {
+        let cap = self.events.capacity();
+        let limit = if is_note_release(&event.body) {
+            cap
+        } else {
+            cap - self.note_off_reserve()
+        };
+        if self.events.len() >= limit {
+            self.dropped = self.dropped.saturating_add(1);
+            return Err(EventListFull);
+        }
+        self.events.push(event);
+        Ok(())
+    }
+
+    /// Number of events [`Self::try_push`] refused since this list was
+    /// built. Survives [`Self::clear`], so a wrapper can sample it once
+    /// per block and report the difference outside the audio thread.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Number of events the list can hold before [`Self::try_push`]
+    /// starts refusing note-offs too.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    /// Slots at the top of [`Self::capacity`] that [`Self::try_push`]
+    /// keeps for note-offs and all-notes-off controllers.
+    #[must_use]
+    pub fn note_off_reserve(&self) -> usize {
+        NOTE_OFF_RESERVE.min(self.events.capacity() / 4)
     }
 
     /// Sort the list by `sample_offset` if it isn't already, keeping
@@ -676,5 +773,127 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec![(0, 2), (10, 0), (510, 1), (510, 3)]);
+    }
+
+    fn param(id: u32) -> Event {
+        Event::new(0, EventBody::ParamChange { id, value: 0.5 })
+    }
+
+    fn note_on(note: u8) -> Event {
+        Event::new(
+            0,
+            EventBody::NoteOn {
+                group: 0,
+                channel: 0,
+                note,
+                velocity: 100,
+            },
+        )
+    }
+
+    fn note_off(note: u8) -> Event {
+        Event::new(
+            0,
+            EventBody::NoteOff {
+                group: 0,
+                channel: 0,
+                note,
+                velocity: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn try_push_refuses_past_capacity_without_reallocating() {
+        let mut list = EventList::with_capacity(64);
+        let cap = list.capacity();
+        let base = list.events.as_ptr();
+        // Fill all the way with note-offs, which may use the reserve.
+        for n in 0..cap {
+            list.try_push(note_off(u8::try_from(n % 128).unwrap()))
+                .expect("room");
+        }
+        assert_eq!(list.try_push(note_off(1)), Err(EventListFull));
+        assert_eq!(list.len(), cap);
+        assert_eq!(list.capacity(), cap);
+        assert_eq!(list.events.as_ptr(), base, "backing buffer must not move");
+        assert_eq!(list.dropped_events(), 1);
+    }
+
+    #[test]
+    fn note_ons_stop_at_the_reserve_and_note_offs_still_land() {
+        let mut list = EventList::with_capacity(64);
+        let cap = list.capacity();
+        let reserve = list.note_off_reserve();
+        assert!(reserve > 0);
+        let mut accepted = Vec::new();
+        for n in 0..u8::try_from(cap).unwrap() {
+            if list.try_push(note_on(n)).is_ok() {
+                accepted.push(n);
+            }
+        }
+        assert_eq!(accepted.len(), cap - reserve);
+        assert_eq!(list.dropped_events(), reserve as u64);
+        // The matching releases all fit.
+        for &n in accepted.iter().take(reserve) {
+            list.try_push(note_off(n)).expect("reserve holds note-offs");
+        }
+        assert_eq!(list.len(), cap);
+        assert_eq!(list.dropped_events(), reserve as u64, "no note-off dropped");
+    }
+
+    #[test]
+    fn all_notes_off_controllers_use_the_reserve() {
+        let mut list = EventList::with_capacity(64);
+        let cap = list.capacity();
+        while list.len() < cap - list.note_off_reserve() {
+            list.try_push(param(0)).unwrap();
+        }
+        let cc = |cc| {
+            Event::new(
+                0,
+                EventBody::ControlChange {
+                    group: 0,
+                    channel: 0,
+                    cc,
+                    value: 0,
+                },
+            )
+        };
+        assert_eq!(list.try_push(cc(1)), Err(EventListFull));
+        assert!(list.try_push(cc(123)).is_ok());
+        assert!(list.try_push(cc(120)).is_ok());
+        assert_eq!(list.dropped_events(), 1);
+    }
+
+    #[test]
+    fn dropped_events_counts_only_what_was_dropped() {
+        let mut list = EventList::with_capacity(64);
+        let cap = list.capacity();
+        for id in 0..cap {
+            let _ = list.try_push(param(u32::try_from(id).unwrap()));
+        }
+        let kept = list.len();
+        assert_eq!(list.dropped_events(), (cap - kept) as u64);
+        list.clear();
+        assert_eq!(list.dropped_events(), (cap - kept) as u64);
+        list.try_push(param(0)).unwrap();
+        assert_eq!(list.dropped_events(), (cap - kept) as u64);
+    }
+
+    #[test]
+    fn tiny_list_reserves_a_quarter() {
+        let list = EventList::with_capacity(8);
+        assert_eq!(list.note_off_reserve(), list.capacity() / 4);
+        let list = EventList::with_capacity(4096);
+        assert_eq!(list.note_off_reserve(), NOTE_OFF_RESERVE);
+    }
+
+    #[test]
+    fn default_list_refuses_try_push_but_push_still_grows() {
+        let mut list = EventList::default();
+        assert_eq!(list.try_push(note_off(0)), Err(EventListFull));
+        list.push(param(0));
+        assert_eq!(list.len(), 1);
     }
 }

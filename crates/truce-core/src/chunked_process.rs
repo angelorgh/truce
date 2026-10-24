@@ -368,7 +368,9 @@ fn rebase_events_into(
                     events.sysex_bytes(&ev.body),
                 );
             }
-            body => scratch.push(Event::on_port(rebased_offset, ev.port, body)),
+            body => {
+                let _ = scratch.try_push(Event::on_port(rebased_offset, ev.port, body));
+            }
         }
     }
 }

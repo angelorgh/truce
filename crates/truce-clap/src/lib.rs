@@ -1222,7 +1222,7 @@ fn push_note_offs<P: PluginExport>(
     for p in first_port..=last_port {
         if let (NoteAxis::One(channel), NoteAxis::One(note)) = (channel, key) {
             sounding_notes.clear(p, channel, note);
-            event_list.push(Event::on_port(
+            let _ = event_list.try_push(Event::on_port(
                 sample_offset,
                 p,
                 EventBody::NoteOff {
@@ -1234,7 +1234,7 @@ fn push_note_offs<P: PluginExport>(
             ));
         } else {
             sounding_notes.drain_matching(p, channel.filter(), key.filter(), |channel, note| {
-                event_list.push(Event::on_port(
+                let _ = event_list.try_push(Event::on_port(
                     sample_offset,
                     p,
                     EventBody::NoteOff {
@@ -1290,7 +1290,7 @@ fn push_note_expressions<P: PluginExport>(
             downconvert_to_midi1(&decoded)
         };
         if let Some(body) = body {
-            event_list.push(Event::on_port(sample_offset, p, body));
+            let _ = event_list.try_push(Event::on_port(sample_offset, p, body));
         }
     };
     for p in first_port..=last_port {
@@ -1372,7 +1372,7 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // every other format. Plugins that want CLAP's full
                     // float precision can handle `NoteOn2` from
                     // `CLAP_EVENT_MIDI2` (when the host emits that path).
-                    scr.event_list.push(Event::on_port(
+                    let _ = scr.event_list.try_push(Event::on_port(
                         sample_offset,
                         port,
                         EventBody::NoteOn {
@@ -1413,7 +1413,7 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // `chunked_process::process_chunked` - that way
                     // the smoother sees `set_target` at the event's
                     // sample, not at the head of the audio block.
-                    scr.event_list.push(Event::on_port(
+                    let _ = scr.event_list.try_push(Event::on_port(
                         sample_offset,
                         port,
                         EventBody::ParamChange {
@@ -1429,7 +1429,7 @@ unsafe fn convert_input_events<P: PluginExport>(
                         continue;
                     }
                     let mod_event = &*header.cast::<clap_event_param_value>();
-                    scr.event_list.push(Event::on_port(
+                    let _ = scr.event_list.try_push(Event::on_port(
                         sample_offset,
                         port,
                         EventBody::ParamMod {
@@ -1441,7 +1441,7 @@ unsafe fn convert_input_events<P: PluginExport>(
                 }
                 CLAP_EVENT_TRANSPORT => {
                     let transport = &*header.cast::<clap_event_transport>();
-                    scr.event_list.push(Event::new(
+                    let _ = scr.event_list.try_push(Event::new(
                         sample_offset,
                         EventBody::Transport(build_transport_info(transport, scr.sample_rate)),
                     ));

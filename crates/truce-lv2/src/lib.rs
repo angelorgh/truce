@@ -561,7 +561,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 // LV2 control-port reads land at sample 0 of the block
                 // so the chunker applies them on entry to the first
                 // sub-block, equivalent to the prior eager behaviour.
-                inst.event_list.push(Event::new(
+                let _ = inst.event_list.try_push(Event::new(
                     0,
                     EventBody::ParamChange {
                         id: pid,
@@ -607,7 +607,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                     if let Some(&(_, pid)) =
                         inst.param_urid_to_id.iter().find(|(u, _)| *u == property)
                     {
-                        inst.event_list.push(Event::new(
+                        let _ = inst.event_list.try_push(Event::new(
                             sample_offset,
                             EventBody::ParamChange { id: pid, value },
                         ));
@@ -639,7 +639,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                     }
                     if let Some(mut event) = atom::midi_bytes_to_event(sample_offset, bytes) {
                         event.port = event_port;
-                        inst.event_list.push(event);
+                        let _ = inst.event_list.try_push(event);
                     }
                 });
             }
