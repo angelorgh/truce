@@ -148,12 +148,84 @@ fn drain_sysex_input(ready: &SysExQueue, free: &SysExQueue, event_list: &mut Eve
     }
 }
 
+/// One process-emitted `ParamChange` awaiting host notification.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParamNotifyEntry {
+    id: u32,
+    /// Plain value, as AU wants.
+    value: f32,
+    /// [`ParamGenerations::get`] for `id`, read by the audio thread when
+    /// it queued the change. A different value at notify time means the
+    /// host or the user wrote the parameter since, so this entry is stale.
+    generation: u64,
+}
+
+/// Per-parameter write counters, bumped on every host-thread or editor
+/// write and read (wait-free) by the audio thread when it queues a
+/// plugin-emitted change. The notifier compares the queued counter with
+/// the current one so it never writes an older value over a newer one.
+/// Ids the plugin doesn't declare are untracked: they read as `0` and
+/// never go stale.
+#[cfg(any(target_os = "macos", test))]
+struct ParamGenerations {
+    /// Sorted, so a lookup is a binary search (no allocation, no lock).
+    ids: Box<[u32]>,
+    counters: Box<[AtomicU64]>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ParamGenerations {
+    fn new(ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut ids: Vec<u32> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let counters = ids.iter().map(|_| AtomicU64::new(0)).collect();
+        Self {
+            ids: ids.into_boxed_slice(),
+            counters,
+        }
+    }
+
+    /// Record a write to `id` that supersedes any queued plugin change.
+    fn bump(&self, id: u32) {
+        if let Ok(i) = self.ids.binary_search(&id) {
+            self.counters[i].fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn get(&self, id: u32) -> u64 {
+        self.ids
+            .binary_search(&id)
+            .map_or(0, |i| self.counters[i].load(Ordering::Acquire))
+    }
+}
+
+/// Reduce a drained batch to what the host should still hear: the latest
+/// queued value per parameter, and none for a parameter that was written
+/// after that value was queued. Keeps first-seen parameter order.
+#[cfg(any(target_os = "macos", test))]
+fn retain_fresh_param_changes(batch: &mut Vec<ParamNotifyEntry>, gens: &ParamGenerations) {
+    let mut kept = 0;
+    for i in 0..batch.len() {
+        let entry = batch[i];
+        if let Some(slot) = batch[..kept].iter().position(|e| e.id == entry.id) {
+            batch[slot] = entry;
+        } else {
+            batch[kept] = entry;
+            kept += 1;
+        }
+    }
+    batch.truncate(kept);
+    batch.retain(|e| gens.get(e.id) == e.generation);
+}
+
 /// Wait-free queue for AU v2 process-emitted `ParamChange` feedback:
-/// the audio thread pushes `(param_id, plain_value)`, the notifier
+/// the audio thread pushes a [`ParamNotifyEntry`], the notifier
 /// thread drains and forwards them to the host. Sized to a full
 /// block's worth of emissions so a normal block never drops.
 #[cfg(target_os = "macos")]
-type ParamNotifyQueue = crossbeam_queue::ArrayQueue<(u32, f32)>;
+type ParamNotifyQueue = crossbeam_queue::ArrayQueue<ParamNotifyEntry>;
 
 /// Off-audio-thread host-notify pump for AU v2 (macOS only). When a
 /// plugin changes its own parameters during `process()`, the host UI /
@@ -167,6 +239,8 @@ type ParamNotifyQueue = crossbeam_queue::ArrayQueue<(u32, f32)>;
 #[cfg(target_os = "macos")]
 struct ParamNotifier {
     queue: Arc<ParamNotifyQueue>,
+    /// Shared with the instance, which bumps it on host / editor writes.
+    gens: Arc<ParamGenerations>,
     stop: Arc<AtomicBool>,
     /// Set by the audio thread when `latency()` changes; drained on the
     /// same wakeup as the param queue. The notifier thread broadcasts a
@@ -188,16 +262,19 @@ impl ParamNotifier {
     /// notifier is dropped - guaranteed because it lives in the
     /// `AuInstance` and `cb_destroy` drops it (joining the thread)
     /// before the shim frees the component.
-    unsafe fn spawn(ctx: SendPtr<std::ffi::c_void>) -> Option<Self> {
+    unsafe fn spawn(ctx: SendPtr<std::ffi::c_void>, gens: Arc<ParamGenerations>) -> Option<Self> {
         let queue = Arc::new(ParamNotifyQueue::new(EVENT_LIST_PREALLOC));
         let stop = Arc::new(AtomicBool::new(false));
         let latency_dirty = Arc::new(AtomicBool::new(false));
-        let (q, s, ld) = (
+        let (q, s, ld, g) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             Arc::clone(&latency_dirty),
+            Arc::clone(&gens),
         );
-        let drain = move || {
+        // Reused across drains; this thread may allocate.
+        let mut batch: Vec<ParamNotifyEntry> = Vec::with_capacity(EVENT_LIST_PREALLOC);
+        let mut drain = move || {
             // SAFETY (both calls): `ctx` is an opaque key the C side maps
             // to its component; the Rust instance is never dereferenced
             // through it, and this thread is joined before the component
@@ -205,8 +282,18 @@ impl ParamNotifier {
             if ld.swap(false, Ordering::AcqRel) {
                 unsafe { truce_au_v2_host_latency_changed(ctx.as_ptr().cast_mut()) };
             }
-            while let Some((id, value)) = q.pop() {
-                unsafe { truce_au_v2_host_set_param(ctx.as_ptr().cast_mut(), id, value) };
+            batch.clear();
+            while let Some(entry) = q.pop() {
+                batch.push(entry);
+            }
+            // Coalesce to the latest value per parameter and drop what a
+            // host / editor write has superseded since it was queued, so
+            // an older plugin value never overwrites a newer one. A write
+            // landing between this check and the call below still loses
+            // the race; that window is the length of one FFI call.
+            retain_fresh_param_changes(&mut batch, &g);
+            for e in &batch {
+                unsafe { truce_au_v2_host_set_param(ctx.as_ptr().cast_mut(), e.id, e.value) };
             }
         };
         let handle = thread::Builder::new()
@@ -223,6 +310,7 @@ impl ParamNotifier {
         let thread = handle.thread().clone();
         Some(Self {
             queue,
+            gens,
             stop,
             latency_dirty,
             thread,
@@ -297,6 +385,10 @@ struct AuInstance<P: PluginExport> {
     /// `None` only if the notifier thread failed to spawn.
     #[cfg(target_os = "macos")]
     param_notify: Option<ParamNotifier>,
+    /// Write counters that let the notifier discard a plugin-emitted
+    /// value a host or editor write has since superseded.
+    #[cfg(target_os = "macos")]
+    param_gens: Arc<ParamGenerations>,
     /// Cached param-info table for the chunker's split predicate.
     param_infos: Vec<ParamInfo>,
     /// `min_subblock_samples` from `truce.toml`'s `[automation]`.
@@ -451,6 +543,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
                 #[cfg(target_os = "macos")]
                 param_notify: None,
+                #[cfg(target_os = "macos")]
+                param_gens: Arc::new(ParamGenerations::new(
+                    param_infos.iter().map(|info| info.id),
+                )),
                 param_infos,
                 min_subblock_samples: info.automation.min_subblock_samples,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
@@ -496,7 +592,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
-                (*raw).param_notify = ParamNotifier::spawn(ctx);
+                (*raw).param_notify = ParamNotifier::spawn(ctx, Arc::clone(&(*raw).param_gens));
             }
             raw.cast::<std::ffi::c_void>()
         },
@@ -873,7 +969,12 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             for event in scr.output_events.iter() {
                 if let EventBody::ParamChange { id, value } = event.body {
                     // `value` is plain, as AU wants.
-                    if notifier.queue.push((id, f32::from_f64(value))).is_ok() {
+                    let entry = ParamNotifyEntry {
+                        id,
+                        value: f32::from_f64(value),
+                        generation: notifier.gens.get(id),
+                    };
+                    if notifier.queue.push(entry).is_ok() {
                         pushed = true;
                     }
                 }
@@ -994,6 +1095,9 @@ unsafe extern "C" fn cb_param_set_value<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
+        // Bump first: a plugin value queued before this write is stale.
+        #[cfg(target_os = "macos")]
+        inst.param_gens.bump(id);
         inst.params_arc.set_plain(id, value);
     }
 }
@@ -1878,6 +1982,8 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                 let snapshot = Arc::clone(&inst.snapshot);
                 let ctx_raw = SendPtr::new(ctx);
                 let params_for_set = params.clone();
+                #[cfg(target_os = "macos")]
+                let gens_for_set = Arc::clone(&inst.param_gens);
                 let params_for_get = params.clone();
                 let params_for_plain = params.clone();
                 let params_for_fmt = params.clone();
@@ -1916,6 +2022,9 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                             // + get_plain) instead of two - the
                             // `#[derive(Params)]` impl can compute both in
                             // a single match-arm walk.
+                            // The editor's value is the newest: a plugin
+                            // change still queued must not overwrite it.
+                            gens_for_set.bump(id);
                             let plain = f32::from_f64(
                                 params_for_set.set_normalized_returning_plain(id, value),
                             );
@@ -2702,12 +2811,22 @@ mod tests {
         // SAFETY: `dummy` is only ever compared (never dereferenced) by
         // the C map lookup, and the notifier is dropped (joined) below
         // while still in scope.
-        let notifier =
-            unsafe { ParamNotifier::spawn(SendPtr::new(dummy)) }.expect("spawn notifier");
+        let notifier = unsafe {
+            ParamNotifier::spawn(
+                SendPtr::new(dummy),
+                std::sync::Arc::new(ParamGenerations::new([0])),
+            )
+        }
+        .expect("spawn notifier");
 
         // Payload value is irrelevant (the host-set FFI no-ops here).
         for i in 0..100u32 {
-            assert!(notifier.queue.push((i, 1.0)).is_ok());
+            let entry = ParamNotifyEntry {
+                id: i,
+                value: 1.0,
+                generation: 0,
+            };
+            assert!(notifier.queue.push(entry).is_ok());
         }
         notifier.thread.unpark();
 
@@ -2722,6 +2841,75 @@ mod tests {
 
         // Must stop + join without hanging.
         drop(notifier);
+    }
+
+    use super::{ParamGenerations, ParamNotifyEntry, retain_fresh_param_changes};
+
+    fn change(id: u32, value: f32, gens: &ParamGenerations) -> ParamNotifyEntry {
+        ParamNotifyEntry {
+            id,
+            value,
+            generation: gens.get(id),
+        }
+    }
+
+    /// A host or editor write after the plugin queued a change makes that
+    /// change stale: the notifier must not write the older value back.
+    #[test]
+    fn param_notify_drops_value_superseded_by_a_later_write() {
+        let gens = ParamGenerations::new([1, 2]);
+        let mut batch = vec![change(1, 0.25, &gens), change(2, 0.5, &gens)];
+        gens.bump(1); // host / user sets param 1 before the notifier runs
+        retain_fresh_param_changes(&mut batch, &gens);
+        assert_eq!(batch, vec![change(2, 0.5, &gens)]);
+    }
+
+    /// A change queued after the write is newer than it and still goes out.
+    #[test]
+    fn param_notify_keeps_value_queued_after_a_write() {
+        let gens = ParamGenerations::new([7]);
+        gens.bump(7);
+        let mut batch = vec![change(7, 0.75, &gens)];
+        retain_fresh_param_changes(&mut batch, &gens);
+        assert_eq!(batch, vec![change(7, 0.75, &gens)]);
+    }
+
+    /// Several queued values for one parameter collapse to the last one;
+    /// first-seen parameter order is kept.
+    #[test]
+    fn param_notify_coalesces_to_latest_value_per_param() {
+        let gens = ParamGenerations::new([1, 2]);
+        let mut batch = vec![
+            change(1, 0.1, &gens),
+            change(2, 0.2, &gens),
+            change(1, 0.3, &gens),
+            change(1, 0.4, &gens),
+        ];
+        retain_fresh_param_changes(&mut batch, &gens);
+        assert_eq!(batch, vec![change(1, 0.4, &gens), change(2, 0.2, &gens)]);
+    }
+
+    /// The generation of the surviving entry decides: a write between two
+    /// queued values supersedes the first, not the second.
+    #[test]
+    fn param_notify_write_between_two_values_keeps_the_later_one() {
+        let gens = ParamGenerations::new([3]);
+        let first = change(3, 0.1, &gens);
+        gens.bump(3);
+        let second = change(3, 0.9, &gens);
+        let mut batch = vec![first, second];
+        retain_fresh_param_changes(&mut batch, &gens);
+        assert_eq!(batch, vec![second]);
+    }
+
+    /// Ids the plugin doesn't declare are never tracked, so never stale.
+    #[test]
+    fn param_notify_untracked_id_is_never_stale() {
+        let gens = ParamGenerations::new([1]);
+        let mut batch = vec![change(99, 0.5, &gens)];
+        gens.bump(99);
+        retain_fresh_param_changes(&mut batch, &gens);
+        assert_eq!(batch, vec![change(99, 0.5, &gens)]);
     }
 
     /// Build a prefilled free-list mirroring the constructor.
